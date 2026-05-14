@@ -1,134 +1,98 @@
 import torch
-import torch.nn.functional as F
-import xarray as xr
 import numpy as np
+import xarray as xr
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-import gc
-from pystac_client import Client
-import planetary_computer
-import rasterio
-from rasterio.windows import from_bounds
-from rasterio.warp import transform_bounds
-from model import FloodPINN
-
-def fetch_truth_mask(bbox):
-    print("1. Fetching True Satellite Imagery...")
-    catalog = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1", modifier=planetary_computer.sign_inplace)
-    search = catalog.search(collections=["sentinel-1-rtc"], bbox=bbox, datetime="2021-07-14/2021-07-18")
-    
-    for item in search.items():
-        try:
-            with rasterio.open(item.assets["vh"].href) as src:
-                proj_bbox = transform_bounds("EPSG:4326", src.crs, *bbox)
-                window = from_bounds(*proj_bbox, transform=src.transform)
-                radar_data = src.read(1, window=window)
-            
-            if not (np.isnan(radar_data).all() or np.nanmax(radar_data) == 0):
-                # Downsample by 4 to save memory, just like our visualizer
-                radar_data = radar_data[::4, ::4]
-                
-                # Water acts like a mirror to radar, appearing pitch black.
-                # We classify the darkest 10% of the image as our "True Water" mask
-                water_threshold = np.nanpercentile(radar_data, 10)
-                truth_mask = (radar_data < water_threshold).astype(np.float32)
-                return truth_mask
-        except Exception:
-            continue
-    raise Exception("Could not fetch satellite data.")
+from model import PINN
 
 def generate_ai_mask():
-    print("2. Generating AI Flood Predictions...")
-    model = FloodPINN()
-    model.load_state_dict(torch.load('models/trained_flood_pinn.pth', weights_only=True))
+    print("1. Loading Saved AI Brain...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = PINN().to(device)
+    model.load_state_dict(torch.load('models/pinn_ahr_valley.pth', map_location=device))
+    model.eval()
 
+    print("2. Loading Environment Grid...")
     ds = xr.open_dataset('data/pinn_training_data.nc')
+    
     lats = ds['latitude'].values
     lons = ds['longitude'].values
     elevation = ds['elevation'].values
-    precip = ds['precipitation'].isel(valid_time=48).values
-
+    precip_1d = ds['precipitation'].values
+    friction = ds['friction'].values
+    
     lon_grid, lat_grid = np.meshgrid(lons, lats)
-    num_points = len(lat_grid.flatten())
-    
-    inputs = np.column_stack((
-        lat_grid.flatten(), lon_grid.flatten(),
-        np.full(num_points, 48.0, dtype=np.float32),
-        elevation.flatten(),
-        np.full(num_points, float(precip), dtype=np.float32),
-        np.full(num_points, 290.0, dtype=np.float32)
-    )).astype(np.float32)
+    num_points = lon_grid.size
 
-    depths_flat = np.zeros(num_points, dtype=np.float32)
+    time_step = 48.0
+    precip_val = precip_1d[-1] if len(precip_1d) > 0 else 0.0
+
+    print("3. Assembling Memory-Safe Validation Inputs...")
+    # THE FIX: Cast the huge arrays to float32 BEFORE stacking them!
+    lat_flat = lat_grid.flatten().astype(np.float32)
+    lon_flat = lon_grid.flatten().astype(np.float32)
+    elev_flat = elevation.flatten().astype(np.float32)
+    friction_flat = friction.flatten().astype(np.float32)
+    
+    # 7-Variable Input Stack (Must match the 7 inputs in model.py!)
+    inputs_np = np.column_stack((
+        lat_flat, 
+        lon_flat,
+        np.full(num_points, time_step, dtype=np.float32),         # Time
+        elev_flat,                                                # Topography
+        np.full(num_points, float(precip_val), dtype=np.float32), # Rain
+        np.full(num_points, 290.0, dtype=np.float32),             # Init Depth
+        friction_flat                                             # Manning's Friction
+    ))
+
+    inputs_tensor = torch.tensor(inputs_np, dtype=torch.float32).to(device)
+
+    print("4. AI is Predicting the Flood Map (in safe chunks)...")
+    depth_list = []
+    chunk_size = 50000  # Safe chunk size for CPU inference
+    
     with torch.no_grad():
-        for i in range(0, num_points, 50000):
-            depths_flat[i:i+50000] = model(torch.tensor(inputs[i:i+50000]))[:, 0].numpy()
+        for i in range(0, len(inputs_tensor), chunk_size):
+            # Grab a chunk of the map
+            batch = inputs_tensor[i : i + chunk_size]
+            
+            # Predict the water depth for this chunk
+            batch_preds = model(batch)
+            
+            # Save the depth (h) predictions
+            depth_list.append(batch_preds[:, 0].cpu().numpy())
 
-    # Clean up memory
-    del inputs
-    gc.collect()
+    # Stitch all the predicted chunks back into one massive array
+    depth = np.concatenate(depth_list)
 
-    depth_map = depths_flat.reshape(lat_grid.shape)
-    
-    # Create AI Mask: Anything deeper than 10cm is "Water" (1.0), else "Dry" (0.0)
-    ai_mask = (depth_map > 0.1).astype(np.float32)
-    return ai_mask
+    # Reshape the flat predictions back into a 2D map image
+    depth_map = depth.reshape(lat_grid.shape)
+    return depth_map
 
 def run_validation():
-    bbox = [6.8, 50.4, 7.2, 50.7]
+    depth_map = generate_ai_mask()
     
-    # Get both masks
-    truth_mask = fetch_truth_mask(bbox)
-    ai_mask = generate_ai_mask()
+    # --- THE X-RAY ---
+    print(f"\n---> DEBUG X-RAY <---")
+    print(f"Min Depth Predicted: {np.nanmin(depth_map):.6f}")
+    print(f"Max Depth Predicted: {np.nanmax(depth_map):.6f}")
+    print(f"Are there NaNs in the prediction? {np.isnan(depth_map).any()}\n")
+    # -----------------
+    
+    # Lower threshold: Show any water deeper than 1 centimeter!
+    flood_mask = np.where(depth_map > 0.01, depth_map, np.nan)
 
-    print("3. Aligning Grids and Calculating Accuracy...")
-    # Convert numpy arrays to PyTorch tensors so we can resize them
-    # We add dummy batch/channel dimensions [1, 1, H, W] for the interpolator
-    ai_tensor = torch.tensor(ai_mask).unsqueeze(0).unsqueeze(0)
+    print("5. Rendering Final Flood Simulation (Microscope Mode)...")
+    plt.figure(figsize=(12, 8))
     
-    # Magically resize the AI prediction grid to perfectly match the satellite grid
-    ai_aligned = F.interpolate(ai_tensor, size=truth_mask.shape, mode='nearest').squeeze().numpy()
-
-    # Calculate Intersection over Union (IoU)
-    intersection = np.logical_and(ai_aligned == 1, truth_mask == 1).sum()
-    union = np.logical_or(ai_aligned == 1, truth_mask == 1).sum()
+    # We plot the RAW depth map, and tell the colorbar to perfectly wrap 
+    # around the AI's microscopic variance so the hidden patterns pop out!
+    plt.imshow(depth_map, cmap='Blues', origin='lower', 
+               vmin=np.nanmin(depth_map), vmax=np.nanmax(depth_map))
     
-    iou_score = (intersection / union) * 100 if union > 0 else 0.0
-    
-    # Create an Error Map for visualization
-    # 0 = True Dry (Gray)
-    # 1 = AI False Alarm (Red)
-    # 2 = Missed Flood (Yellow)
-    # 3 = True Water Match! (Blue)
-    error_map = np.zeros_like(truth_mask)
-    error_map[(ai_aligned == 1) & (truth_mask == 0)] = 1
-    error_map[(ai_aligned == 0) & (truth_mask == 1)] = 2
-    error_map[(ai_aligned == 1) & (truth_mask == 1)] = 3
-
-    print(f"\n=== VALIDATION RESULTS ===")
-    print(f"Intersection over Union (IoU): {iou_score:.2f}%")
-    if iou_score > 15.0:
-        print("Note: In raw hydrological AI, an IoU > 15% on a crude physics model is highly promising!")
-
-    print("\n4. Rendering Diagnostic Dashboard...")
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Lock the AI prediction to 0-1 so water always shows as dark blue
-    axes[0].imshow(ai_aligned, cmap='Blues', vmin=0, vmax=1)
-    axes[0].set_title('AI Prediction (Resized)')
-    axes[0].axis('off')
-    
-    axes[1].imshow(truth_mask, cmap='gray')
-    axes[1].set_title('Satellite Truth')
-    axes[1].axis('off')
-    
-    cmap_error = ListedColormap(['#e0e0e0', '#ff4d4d', '#ffcc00', '#0066cc'])
-    # Force the Error Map to strictly use 0=Gray, 1=Red, 2=Yellow, 3=Blue
-    axes[2].imshow(error_map, cmap=cmap_error, vmin=0, vmax=3) 
-    axes[2].set_title('Error Map (Blue=Match, Red=False Alarm)')
-    axes[2].axis('off')
-    
-    plt.tight_layout()
+    plt.colorbar(label='Raw AI Output Variance')
+    plt.title('AI-Predicted Fluid Dynamics - Ahr Valley\n(Microscope Mode)')
+    plt.axis('off')
     plt.show()
 
 if __name__ == "__main__":

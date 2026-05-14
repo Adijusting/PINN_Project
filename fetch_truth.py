@@ -2,7 +2,7 @@ from pystac_client import Client
 import planetary_computer
 import rasterio
 from rasterio.windows import from_bounds
-from rasterio.warp import transform_bounds  # <-- NEW: The Geographic Translator
+from rasterio.warp import transform_bounds  
 import matplotlib.pyplot as plt
 import numpy as np
 import sys

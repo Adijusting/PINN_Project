@@ -1,97 +1,88 @@
 import torch
 import torch.optim as optim
-import xarray as xr
 import numpy as np
-from model import FloodPINN
-from physics import calculate_physics_loss
-
-def prepare_training_data():
-    print("Loading Master PINN dataset...")
-    ds = xr.open_dataset('data/pinn_training_data.nc')
-    
-    # Extract the exact bounds of your Ahr valley data
-    lats = ds['latitude'].values
-    lons = ds['longitude'].values
-
-    # convert time to hours from start
-    times = np.arange(len(ds['valid_time']))
-    
-    # we will use these bounds to generate random training points
-    bounds = {
-        'lat_min': lats.min(), 'lat_max': lats.max(),
-        'lon_min': lons.min(), 'lon_max': lons.max(),
-        'time_min': times.min(), 'time_max': times.max(),
-        
-        # get max/min for basic normalization
-        'z_max': ds['elevation'].max().values, 'z_min': ds['elevation'].min().values,
-        'p_max': ds['precipitation'].max().values, 'p_min': ds['precipitation'].min().values
-    }
-    
-    return ds, bounds
-
-def generate_collocation_points(ds, bounds, num_points=2000):
-    
-    lats = np.random.uniform(bounds['lat_min'], bounds['lat_max'], num_points)
-    lons = np.random.uniform(bounds['lon_min'], bounds['lon_max'], num_points)
-    times = np.random.uniform(bounds['time_min'], bounds['time_max'], num_points)
-    
-    # In a full-sclae model, we would precisely interpolate elevation/weather 
-    z = np.random.uniform(bounds['z_min'], bounds['z_max'], num_points)
-    P = np.random.uniform(bounds['p_min'], bounds['p_max'], num_points)
-    
-    # We don't strictly need temperature for pure shallow water equations
-    temp = np.full(num_points, 290.0)
-    
-    # Stack them into our 6-feature input tensor
-    points = np.column_stack((lats, lons, times, z, P, temp))
-    
-    # Convert to PyTorch tensor and enable gradients for the physics engine
-    inputs = torch.tensor(points, dtype=torch.float32)
-    inputs.requires_grad_(True)
-    
-    return inputs
+import xarray as xr
+from model import PINN
+from physics import shallow_water_loss
 
 def train_pinn():
-    ds, bounds = prepare_training_data()
-    print("\nInitializing PyTorch Model and Adam optimizer")
-    model = FloodPINN()
+    print("1. Initializing AI Architecture...")
+    # Auto-detect GPU if available, otherwise use CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on device: {device}")
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    model = PINN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    print("2. Loading Master Training Dataset...")
+    ds = xr.open_dataset('data/pinn_training_data.nc')
     
-    epochs=500
-    points_per_epoch = 2000
+    lats = ds['latitude'].values
+    lons = ds['longitude'].values
+    elevation = ds['elevation'].values
+    precip_1d = ds['precipitation'].values
+    friction = ds['friction'].values
     
-    print("\nStarting PINN Training")
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    num_points = lon_grid.size
+
+    print("3. Beginning Physics-Informed Training Loop...")
+    epochs = 1000  # Adjust as needed for better accuracy
+    
+    # We will train on the peak storm hour (e.g., Hour 48)
+    time_step = 48.0
+    precip_val = precip_1d[-1] if len(precip_1d) > 0 else 0.0
+
+    # Ensure massive arrays are forced to 32-bit BEFORE stacking to save RAM
+    lat_flat = lat_grid.flatten().astype(np.float32)
+    lon_flat = lon_grid.flatten().astype(np.float32)
+    elev_flat = elevation.flatten().astype(np.float32)
+    friction_flat = friction.flatten().astype(np.float32)
+
+    # Build the 7-Variable Input Stack
+    inputs_np = np.column_stack((
+        lat_flat, 
+        lon_flat,
+        np.full(num_points, time_step, dtype=np.float32),         # Time
+        elev_flat,                                                # Topography
+        np.full(num_points, float(precip_val), dtype=np.float32), # Rain
+        np.full(num_points, 290.0, dtype=np.float32),             # Init Depth
+        friction_flat                                             # Manning's Friction
+    ))
+    
+    # Convert to PyTorch Tensor and push to GPU/CPU
+    inputs_tensor = torch.tensor(inputs_np, dtype=torch.float32).to(device)
+
+    # The actual Training Loop
+    # The actual Training Loop
+    model.train()
+    
+    # THE FIX: Set a safe bite-size for your CPU
+    batch_size = 10000 
+    
     for epoch in range(epochs):
-        # 1. Clear old gradients
         optimizer.zero_grad()
         
-        # 2. Generate random coordinate points across the Ahr valley
-        inputs = generate_collocation_points(ds, bounds, points_per_epoch)
+        # 1. Randomly sample a batch of pixels from the map
+        # (This prevents the C++ Segfault by keeping the calculus graph small!)
+        idx = torch.randperm(num_points)[:batch_size]
+        batch_inputs = inputs_tensor[idx]
         
-        # 3. Calculate how badly the network breaks physics at those points
-        physics_loss = calculate_physics_loss(model, inputs)
+        # 2. Calculate how badly the AI is breaking the laws of physics on THIS batch
+        loss = shallow_water_loss(model, batch_inputs)
         
-        # 4. Initial condition loss
-        initial_inputs = inputs[:100].clone()
-        initial_inputs[:,2] = 0.0
-        initial_predictions = model(initial_inputs)
-        initial_depths = initial_predictions[:,0:1]
-        inital_loss = torch.mean((initial_depths - 0.0)**2)
-        
-        # 5. Total Loss
-        total_loss = physics_loss + inital_loss
-        
-        # 6. Backpropogation
-        total_loss.backward()
+        # 3. Backpropagation (AI corrects its mistakes)
+        loss.backward()
         optimizer.step()
-        
-        if epoch % 50 == 0:
-            print(f"Epoch {epoch:04d} | Total Loss: {total_loss.item():.6f} | Physics: {physics_loss.item():.6f} | Initial: {inital_loss.item():.6f}")
-            
-    print("\nTraining Complete")
-    torch.save(model.state_dict(), 'models/trained_flood_pinn.pth')
-    print("Network weights saved to 'trained_flood_pinn.pth'")
+
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}/{epochs} | Physics Loss: {loss.item():.6f}")
+
+    print("4. Saving Trained Weights...")
+    torch.save(model.state_dict(), 'models/pinn_ahr_valley.pth')
+    print("Training Complete! Brain saved to 'models/pinn_ahr_valley.pth'")
 
 if __name__ == "__main__":
+    import os
+    os.makedirs('models', exist_ok=True)
     train_pinn()

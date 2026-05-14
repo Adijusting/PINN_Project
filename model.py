@@ -1,44 +1,31 @@
 import torch
 import torch.nn as nn
 
-class FloodPINN(nn.Module):
-    def __init__(self, num_layers=6, neurons_per_layer=64):
-        super(FloodPINN, self).__init__()
+class PINN(nn.Module):
+    def __init__(self):
+        super(PINN, self).__init__()
         
-        # We have 6 input features: [lat, lon, time, elevation, precip, temp]
-        input_dim = 6
+        # --- THE NORMALIZATION SHIELD ---
+        # We pre-program the approximate averages and ranges of the Ahr Valley.
+        # Order: [Lat, Lon, Time, Elev, Precip, Init_Depth, Friction]
+        self.register_buffer('input_mean', torch.tensor([50.55, 7.00, 36.0, 300.0, 0.001, 290.0, 0.05]))
+        self.register_buffer('input_std', torch.tensor([0.15, 0.20, 36.0, 200.0, 0.010, 1.0, 0.05]))
         
-        # 3 output features: [depth(h), velocity_x(u), velocity_y(v)]
-        output_dim = 6
-        
-        # 1. Input Layers
-        layers = [nn.Linear(input_dim, neurons_per_layer), nn.Tanh()]
-        # 2. Hidden layers
-        # We use Tanh as it is smoothly diffrentiable
-        for _ in range(num_layers-1):
-            layers.append(nn.Linear(neurons_per_layer, neurons_per_layer))
-            layers.append(nn.Tanh())
-            
-        # 3. Output layer
-        layers.append(nn.Linear(neurons_per_layer, output_dim))
-        self.network = nn.Sequential(*layers)
-    
+        self.network = nn.Sequential(
+            nn.Linear(7, 128),  
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(),
+            nn.Linear(128, 3) # 3 OUTPUTS: h, u, v
+        )
+
     def forward(self, x):
-        """
-        x is a tensor containing out input: [lat, lon, time, elevation, precip, temp]
-        returns a tensor with our predictions: [h,u,v]
-        """
-        return self.network(x)
-    
-if __name__ == "__main__":
-    print("Initializing Flood PINN architecture...")
-    model=FloodPINN()
-    print(model)
+        # 1. Scale the raw physical inputs down to manageable sizes (-1 to 1)
+        x_normalized = (x - self.input_mean) / self.input_std
         
-    dummy_input = torch.tensor([[50.5, 7.0, 12.0, 250.0, 0.05, 298.0]], dtype=torch.float32)
-        
-    dummy_output = model(dummy_input)
-    print("\nNetwork plumbing test")
-    print(f"Input shape (1 data point, 6 features): {dummy_input.shape}")
-    print(f"Output shape (1 data point, 3 predictions): {dummy_output.shape}")
-    print(f"RAW untrained predictions [h,u,v]: {dummy_output.detach().numpy()}")
+        # 2. Feed the balanced numbers into the network's brain
+        return self.network(x_normalized)
